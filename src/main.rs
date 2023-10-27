@@ -59,14 +59,14 @@ async fn main() {
         .iter()
         .map(|cookie| format!("{}={};", cookie.name(), cookie.value()))
         .collect();
-    println!("{:?}", cookie_str);
     // Close the browser
     driver.quit().await.unwrap();
     let _ = chromedriver.kill();
 
+    
     // A Prover configuration
     let config = ProverConfig::builder()
-        .id("example2")
+        .id("example")
         .server_dns(SERVER_DOMAIN)
         .build()
         .unwrap();
@@ -111,6 +111,8 @@ async fn main() {
     // Build a simple HTTP request with common headers
     let request = Request::builder()
         .uri("https://www.elster.de/eportal/meinestammdaten")
+        .method("GET")
+        .header("Host", "www.elster.de")
         .header("Accept", "*/*")
         .header("Accept-Encoding", "identity")
         .header("Connection", "close")
@@ -125,6 +127,7 @@ async fn main() {
 
     println!("Got a response from the server");
     println!("{:?}", response.status());
+    println!("{:?}", response.headers());
     println!("{:?}", response.body());
     assert!(response.status() == StatusCode::OK);
     // Close the connection to the server
