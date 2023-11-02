@@ -24,7 +24,7 @@ const NOTARY_PORT: u16 = 7047;
 const NOTARY_CA_CERT_PATH: &str = "./rootCA.crt";
 
 // Configuration of notarization
-const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 16742;
+const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 32768;
 
 /// Response object of the /session API
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +61,7 @@ async fn main() {
     let config = ProverConfig::builder()
         .id(session_id)
         .server_dns(SERVER_DOMAIN)
+        .max_transcript_size(NOTARY_MAX_TRANSCRIPT_SIZE)
         .build()
         .unwrap();
 
