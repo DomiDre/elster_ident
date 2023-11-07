@@ -2744,7 +2744,6 @@ dependencies = [
 [[package]]
 name = "tlsn-utils-aio"
 version = "0.1.0"
-source = "git+https://github.com/tlsnotary/tlsn-utils?rev=8d8ffe1#8d8ffe1b962ea9267597e6bdb780d7de80dc9ab5"
 dependencies = [
  "async-std",
  "async-trait",

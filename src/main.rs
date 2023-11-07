@@ -24,7 +24,7 @@ const NOTARY_PORT: u16 = 7047;
 const NOTARY_CA_CERT_PATH: &str = "./rootCA.crt";
 
 // Configuration of notarization
-const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 32768;
+const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 360000;
 
 /// Response object of the /session API
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,9 +123,7 @@ async fn main() {
 
     // Pretty printing :)
     let payload = to_bytes(response.into_body()).await.unwrap().to_vec();
-    let parsed =
-        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&payload)).unwrap();
-    debug!("{}", serde_json::to_string_pretty(&parsed).unwrap());
+    debug!("{}", serde_json::to_string_pretty(&payload).unwrap());
 
     // Close the connection to the server
     let mut client_socket = connection_task.await.unwrap().unwrap().io.into_inner();

@@ -21,3 +21,7 @@ rustls-pemfile = "1"
 
 tlsn-core = { git = "https://github.com/tlsnotary/tlsn"}
 tlsn-prover = { git = "https://github.com/tlsnotary/tlsn", features = ["tracing"]}
+
+[patch.'https://github.com/tlsnotary/tlsn-utils']
+tlsn-utils-aio = { path = "../tlsn-utils/utils-aio" }
+
