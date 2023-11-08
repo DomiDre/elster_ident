@@ -4,6 +4,10 @@
 use eyre::Result;
 use futures::AsyncWriteExt;
 use hyper::{body::to_bytes, client::conn::Parts, Body, Request, StatusCode};
+use opentelemetry::{
+    global,
+    sdk::{export::trace::stdout, propagation::TraceContextPropagator},
+};
 use rustls::{Certificate, ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use std::{fs::File as StdFile, io::BufReader, ops::Range, sync::Arc};
@@ -12,6 +16,7 @@ use tokio::{fs::File, io::AsyncWriteExt as _, net::TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::debug;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 use tlsn_prover::tls::{Prover, ProverConfig};
 
@@ -53,7 +58,7 @@ pub enum ClientType {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    setup_logging();
 
     let (notary_tls_socket, session_id) = setup_notary_connection().await;
 
@@ -100,7 +105,7 @@ async fn main() {
         .header("Accept", "text/html")
         .header("Accept-Language", "en-US,en;q=0.5")
         .header("Accept-Encoding", "identity")
-        .header("Connection", "close")
+        .header("Connection", "keep-alive")
         .header(
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
@@ -338,4 +343,32 @@ fn find_ranges(seq: &[u8], sub_seq: &[&[u8]]) -> (Vec<Range<usize>>, Vec<Range<u
 async fn read_pem_file(file_path: &str) -> Result<BufReader<StdFile>> {
     let key_file = File::open(file_path).await?.into_std().await;
     Ok(BufReader::new(key_file))
+}
+
+fn setup_logging() {
+    // Create a new OpenTelemetry pipeline
+    let tracer = stdout::new_pipeline().install_simple();
+
+    // Create a tracing layer with the configured tracer
+    let tracing_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    // Set the log level
+    let env_filter_layer = EnvFilter::from_default_env();
+
+    // Format the log
+    let format_layer = tracing_subscriber::fmt::layer()
+        // Use a more compact, abbreviated log format
+        .compact()
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    // Set up context propagation
+    global::set_text_map_propagator(TraceContextPropagator::default());
+
+    Registry::default()
+        .with(tracing_layer)
+        .with(env_filter_layer)
+        .with(format_layer)
+        .try_init()
+        .unwrap();
 }
