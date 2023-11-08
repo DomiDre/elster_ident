@@ -27,3 +27,8 @@ tlsn-prover = { git = "https://github.com/tlsnotary/tlsn", features = ["tracing"
 [patch.'https://github.com/tlsnotary/tlsn-utils']
 tlsn-utils-aio = { path = "../tlsn-utils/utils-aio" }
 
+[patch.'https://github.com/tlsnotary/tlsn']
+tlsn-core = { path = "../tlsn/tlsn/tlsn-core" }
+tlsn-prover = { path = "../tlsn/tlsn/tlsn-prover", features = ["tracing"] }
+
+

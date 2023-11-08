@@ -126,10 +126,6 @@ async fn main() {
 
     debug!("Request OK");
 
-    // Pretty printing :)
-    let payload = to_bytes(response.into_body()).await.unwrap().to_vec();
-    debug!("{}", serde_json::to_string_pretty(&payload).unwrap());
-
     // Close the connection to the server
     let mut client_socket = connection_task.await.unwrap().unwrap().io.into_inner();
     client_socket.close().await.unwrap();
