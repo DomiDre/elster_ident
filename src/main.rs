@@ -1,213 +1,314 @@
+/// This example shows how to notarize Discord DMs.
+///
+/// The example uses the notary server implemented in ../../../notary-server
+use eyre::Result;
 use futures::AsyncWriteExt;
-use hyper::{Body, Request, StatusCode};
-use std::ops::Range; // Import this for Unix-like systems
+use hyper::{body::to_bytes, client::conn::Parts, Body, Request, StatusCode};
+use opentelemetry::{
+    global,
+    sdk::{export::trace::stdout, propagation::TraceContextPropagator},
+};
+use rustls::{Certificate, ClientConfig, RootCertStore};
+use serde::{Deserialize, Serialize};
+use std::{fs::File as StdFile, io::BufReader, ops::Range, sync::Arc};
 use tlsn_core::proof::TlsProof;
-use tokio::io::AsyncWriteExt as _;
+use tokio::{fs::File, io::AsyncWriteExt as _, net::TcpStream};
+use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tracing::debug;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 use tlsn_prover::tls::{Prover, ProverConfig};
 
-use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
-use std::{env, path::PathBuf};
-use std::{fs::File, io::Write};
-use tokio::time::{sleep, Duration};
-use thirtyfour::prelude::*;
-
-
 // Setting of the application server
 const SERVER_DOMAIN: &str = "www.elster.de";
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
 
-// Setting of the notary server — make sure these are the same with those in ./simple_notary.rs
+// Setting of the notary server — make sure these are the same with those in ../../../notary-server
 const NOTARY_HOST: &str = "127.0.0.1";
-const NOTARY_PORT: u16 = 8080;
+const NOTARY_PORT: u16 = 7047;
+const NOTARY_CA_CERT_PATH: &str = "./rootCA.crt";
+
+// Configuration of notarization
+const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 360000;
+
+/// Response object of the /session API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotarizationSessionResponse {
+    pub session_id: String,
+}
+
+/// Request object of the /session API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotarizationSessionRequest {
+    pub client_type: ClientType,
+    /// Maximum transcript size in bytes
+    pub max_transcript_size: Option<usize>,
+}
+
+/// Types of client that the prover is using
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ClientType {
+    /// Client that has access to the transport layer
+    Tcp,
+    /// Client that cannot directly access transport layer, e.g. browser extension
+    Websocket,
+}
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    setup_logging();
 
-    let chromedriver_path = extract_chromedriver().expect("Could not init chromedriver");
-    let mut chromedriver = Command::new(&chromedriver_path)
-        .arg("--port=9515")
-        .spawn()
-        .expect("Failed to start chromedriver");
-    sleep(Duration::from_millis(500)).await;
-    
-    let caps = DesiredCapabilities::chrome();
-    let driver = WebDriver::new("http://localhost:9515", caps)
-        .await
-        .expect("Failed to init webdriver");
+    let (notary_tls_socket, session_id) = setup_notary_connection().await;
 
-    driver
-        .set_implicit_wait_timeout(Duration::new(0, 0))
-        .await
-        .expect("Could not disable timeout");
-    driver
-        .goto("https://www.elster.de/eportal/login/elstersecure")
-        .await
-        .expect("Unable to open webpage to elster secure login");
-    driver
-        .query(By::XPath("//*[contains(text(),'Neues Formular')]"))
-        .first()
-        .await
-        .expect("Did not find element expected from login page");
-
-    let cookies = driver.get_all_cookies().await.unwrap();
-    let cookie_str: String = cookies
-        .iter()
-        .map(|cookie| format!("{}={};", cookie.name(), cookie.value()))
-        .collect();
-    // Close the browser
-    driver.quit().await.unwrap();
-    let _ = chromedriver.kill();
-
-    
-    // A Prover configuration
+    // Basic default prover config using the session_id returned from /session endpoint just now
     let config = ProverConfig::builder()
-        .id("example")
+        .id(session_id)
         .server_dns(SERVER_DOMAIN)
+        .max_transcript_size(NOTARY_MAX_TRANSCRIPT_SIZE)
         .build()
         .unwrap();
 
-    // Connect to the Notary
-    let notary_socket = tokio::net::TcpStream::connect((NOTARY_HOST, NOTARY_PORT))
-        .await
-        .unwrap();
-    println!("Connected to the Notary");
-
-    // Create a Prover and set it up with the Notary
-    // This will set up the MPC backend prior to connecting to the server.
-    println!("Creating prover");
+    // Create a new prover and set up the MPC backend.
     let prover = Prover::new(config)
-        .setup(notary_socket.compat())
+        .setup(notary_tls_socket.compat())
         .await
         .unwrap();
 
-    println!("Connecting to server domain");
-    // Connect to the Server via TCP. This is the TLS client socket.
     let client_socket = tokio::net::TcpStream::connect((SERVER_DOMAIN, 443))
         .await
         .unwrap();
 
-    // Bind the Prover to the server connection.
-    // The returned `mpc_tls_connection` is an MPC TLS connection to the Server: all data written
-    // to/read from it will be encrypted/decrypted using MPC with the Notary.
-    let (mpc_tls_connection, prover_fut) = prover.connect(client_socket.compat()).await.unwrap();
+    // Bind the Prover to server connection
+    let (tls_connection, prover_fut) = prover.connect(client_socket.compat()).await.unwrap();
 
-    // Spawn the Prover task to be run concurrently
+    // Spawn the Prover to be run concurrently
     let prover_task = tokio::spawn(prover_fut);
 
-    // Attach the hyper HTTP client to the MPC TLS connection
-    let (mut request_sender, connection) =
-        hyper::client::conn::handshake(mpc_tls_connection.compat())
-            .await
-            .unwrap();
+    // Attach the hyper HTTP client to the TLS connection
+    let (mut request_sender, connection) = hyper::client::conn::handshake(tls_connection.compat())
+        .await
+        .unwrap();
 
     // Spawn the HTTP task to be run concurrently
     let connection_task = tokio::spawn(connection.without_shutdown());
 
     // Build a simple HTTP request with common headers
+    let cookie_str = std::env::var("COOKIE").unwrap();
+
+    // Build a simple HTTP request with common headers
     let request = Request::builder()
-        .uri("https://www.elster.de/eportal/meinestammdaten")
+        .uri("/eportal/meinestammdaten")
         .method("GET")
         .header("Host", "www.elster.de")
-        .header("Accept", "*/*")
+        .header("Accept", "text/html")
+        .header("Accept-Language", "en-US,en;q=0.5")
         .header("Accept-Encoding", "identity")
-        .header("Connection", "close")
-        .header("User-Agent", USER_AGENT)
+        .header("Connection", "keep-alive")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
+        )
         .header("Cookie", cookie_str)
         .body(Body::empty())
         .unwrap();
+
     println!("Starting an MPC TLS connection with the server");
 
-    // Send the request to the Server and get a response via the MPC TLS connection
+    debug!("Sending request");
+
     let response = request_sender.send_request(request).await.unwrap();
 
-    println!("Got a response from the server");
-    println!("{:?}", response.status());
-    println!("{:?}", response.headers());
-    println!("{:?}", response.body());
-    assert!(response.status() == StatusCode::OK);
+    debug!("Sent request");
+
+    assert!(response.status() == StatusCode::OK, "{}", response.status());
+
+    debug!("Request OK");
+
     // Close the connection to the server
     let mut client_socket = connection_task.await.unwrap().unwrap().io.into_inner();
     client_socket.close().await.unwrap();
 
-    // The Prover task should be done now, so we can grab the Prover.
+    // The Prover task should be done now, so we can grab it.
     let prover = prover_task.await.unwrap().unwrap();
 
-    // Prepare for notarization.
+    // Prepare for notarization
     let mut prover = prover.start_notarize();
 
-    // Identify the ranges in the outbound data which contain data which we want to disclose
-    let (sent_public_ranges, _) = find_ranges(
-        prover.sent_transcript().data(),
-        &[
-            // Redact the value of the "User-Agent" header. It will NOT be disclosed.
-            // USER_AGENT.as_bytes(),
-        ],
-    );
+    // Identify the ranges in the transcript that contain secrets
+    let (public_ranges, private_ranges) = find_ranges(prover.sent_transcript().data(), &[]);
 
-    // Identify the ranges in the inbound data which contain data which we want to disclose
-    let (recv_public_ranges, _) = find_ranges(
-        prover.recv_transcript().data(),
-        &[
-            // Redact the value of the Request::builder()title. It will NOT be disclosed.
-            // "Example Domain".as_bytes(),
-        ],
-    );
+    let recv_len = prover.recv_transcript().data().len();
 
     let builder = prover.commitment_builder();
 
-    // Commit to each range of the public outbound data which we want to disclose
-    let sent_commitments: Vec<_> = sent_public_ranges
+    // Collect commitment ids for the outbound transcript
+    let mut commitment_ids = public_ranges
         .iter()
-        .map(|r| builder.commit_sent(r.clone()).unwrap())
-        .collect();
-    // Commit to each range of the public inbound data which we want to disclose
-    let recv_commitments: Vec<_> = recv_public_ranges
-        .iter()
-        .map(|r| builder.commit_recv(r.clone()).unwrap())
-        .collect();
+        .chain(private_ranges.iter())
+        .map(|range| builder.commit_sent(range.clone()).unwrap())
+        .collect::<Vec<_>>();
+
+    // Commit to the full received transcript in one shot, as we don't need to redact anything
+    commitment_ids.push(builder.commit_recv(0..recv_len).unwrap());
 
     // Finalize, returning the notarized session
     let notarized_session = prover.finalize().await.unwrap();
 
-    // Create a proof for all committed data in this session
+    debug!("Notarization complete!");
+
+    // Dump the notarized session to a file
+    let mut file = tokio::fs::File::create("discord_dm_notarized_session.json")
+        .await
+        .unwrap();
+    file.write_all(
+        serde_json::to_string_pretty(&notarized_session)
+            .unwrap()
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let session_proof = notarized_session.session_proof();
+
     let mut proof_builder = notarized_session.data().build_substrings_proof();
 
-    // Reveal all the public ranges
-    for commitment_id in sent_commitments {
-        proof_builder.reveal(commitment_id).unwrap();
-    }
-    for commitment_id in recv_commitments {
-        proof_builder.reveal(commitment_id).unwrap();
-    }
+    // Reveal everything but the auth token (which was assigned commitment id 2)
+    proof_builder.reveal(commitment_ids[0]).unwrap();
+    proof_builder.reveal(commitment_ids[1]).unwrap();
 
     let substrings_proof = proof_builder.build().unwrap();
 
     let proof = TlsProof {
-        session: notarized_session.session_proof(),
+        session: session_proof,
         substrings: substrings_proof,
     };
 
-    // Write the proof to a file
-    let mut file = tokio::fs::File::create("proof.json").await.unwrap();
+    // Dump the proof to a file.
+    let mut file = tokio::fs::File::create("elster.json").await.unwrap();
     file.write_all(serde_json::to_string_pretty(&proof).unwrap().as_bytes())
         .await
         .unwrap();
+}
 
-    println!("Notarization completed successfully!");
-    println!("The proof has been written to proof.json");
+async fn setup_notary_connection() -> (tokio_rustls::client::TlsStream<TcpStream>, String) {
+    // Connect to the Notary via TLS-TCP
+    let mut certificate_file_reader = read_pem_file(NOTARY_CA_CERT_PATH).await.unwrap();
+    let mut certificates: Vec<Certificate> = rustls_pemfile::certs(&mut certificate_file_reader)
+        .unwrap()
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    let certificate = certificates.remove(0);
+
+    let mut root_store = RootCertStore::empty();
+    root_store.add(&certificate).unwrap();
+
+    let client_notary_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let notary_connector = TlsConnector::from(Arc::new(client_notary_config));
+
+    let notary_socket = tokio::net::TcpStream::connect((NOTARY_HOST, NOTARY_PORT))
+        .await
+        .unwrap();
+
+    let notary_tls_socket = notary_connector
+        // Require the domain name of notary server to be the same as that in the server cert
+        .connect("tlsnotaryserver.io".try_into().unwrap(), notary_socket)
+        .await
+        .unwrap();
+
+    // Attach the hyper HTTP client to the notary TLS connection to send request to the /session endpoint to configure notarization and obtain session id
+    let (mut request_sender, connection) = hyper::client::conn::handshake(notary_tls_socket)
+        .await
+        .unwrap();
+
+    // Spawn the HTTP task to be run concurrently
+    let connection_task = tokio::spawn(connection.without_shutdown());
+
+    // Build the HTTP request to configure notarization
+    let payload = serde_json::to_string(&NotarizationSessionRequest {
+        client_type: ClientType::Tcp,
+        max_transcript_size: Some(NOTARY_MAX_TRANSCRIPT_SIZE),
+    })
+    .unwrap();
+
+    let request = Request::builder()
+        .uri(format!("https://{NOTARY_HOST}:{NOTARY_PORT}/session"))
+        .method("POST")
+        .header("Host", NOTARY_HOST)
+        // Need to specify application/json for axum to parse it as json
+        .header("Content-Type", "application/json")
+        .body(Body::from(payload))
+        .unwrap();
+
+    debug!("Sending configuration request");
+
+    let configuration_response = request_sender.send_request(request).await.unwrap();
+
+    debug!("Sent configuration request");
+
+    assert!(configuration_response.status() == StatusCode::OK);
+
+    debug!("Response OK");
+
+    // Pretty printing :)
+    let payload = to_bytes(configuration_response.into_body())
+        .await
+        .unwrap()
+        .to_vec();
+    let notarization_response =
+        serde_json::from_str::<NotarizationSessionResponse>(&String::from_utf8_lossy(&payload))
+            .unwrap();
+
+    debug!("Notarization response: {:?}", notarization_response,);
+
+    // Send notarization request via HTTP, where the underlying TCP connection will be extracted later
+    let request = Request::builder()
+        // Need to specify the session_id so that notary server knows the right configuration to use
+        // as the configuration is set in the previous HTTP call
+        .uri(format!(
+            "https://{}:{}/notarize?sessionId={}",
+            NOTARY_HOST,
+            NOTARY_PORT,
+            notarization_response.session_id.clone()
+        ))
+        .method("GET")
+        .header("Host", NOTARY_HOST)
+        .header("Connection", "Upgrade")
+        // Need to specify this upgrade header for server to extract tcp connection later
+        .header("Upgrade", "TCP")
+        .body(Body::empty())
+        .unwrap();
+
+    debug!("Sending notarization request");
+
+    let response = request_sender.send_request(request).await.unwrap();
+
+    debug!("Sent notarization request");
+
+    assert!(response.status() == StatusCode::SWITCHING_PROTOCOLS);
+
+    debug!("Switched protocol OK");
+
+    // Claim back the TLS socket after HTTP exchange is done
+    let Parts {
+        io: notary_tls_socket,
+        ..
+    } = connection_task.await.unwrap().unwrap();
+
+    (notary_tls_socket, notarization_response.session_id)
 }
 
 /// Find the ranges of the public and private parts of a sequence.
 ///
 /// Returns a tuple of `(public, private)` ranges.
-fn find_ranges(seq: &[u8], private_seq: &[&[u8]]) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+fn find_ranges(seq: &[u8], sub_seq: &[&[u8]]) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     let mut private_ranges = Vec::new();
-    for s in private_seq {
+    for s in sub_seq {
         for (idx, w) in seq.windows(s.len()).enumerate() {
             if w == *s {
                 private_ranges.push(idx..(idx + w.len()));
@@ -234,25 +335,36 @@ fn find_ranges(seq: &[u8], private_seq: &[&[u8]]) -> (Vec<Range<usize>>, Vec<Ran
     (public_ranges, private_ranges)
 }
 
-/// Get chromedriver from bin folder and store it next to executable
-fn extract_chromedriver() -> std::io::Result<PathBuf> {
-    // Get the current executable's directory
-    let current_exe = env::current_exe()?;
-    let current_dir = current_exe.parent().unwrap();
+/// Read a PEM-formatted file and return its buffer reader
+async fn read_pem_file(file_path: &str) -> Result<BufReader<StdFile>> {
+    let key_file = File::open(file_path).await?.into_std().await;
+    Ok(BufReader::new(key_file))
+}
 
-    // Path to extract chromedriver
-    let chromedriver_path = current_dir.join("chromedriver");
-    println!("{:?}", chromedriver_path);
+fn setup_logging() {
+    // Create a new OpenTelemetry pipeline
+    let tracer = stdout::new_pipeline().install_simple();
 
-    // Check if chromedriver is already extracted
-    if !chromedriver_path.exists() {
-        let mut file = File::create(&chromedriver_path)?;
-        file.write_all(include_bytes!("../bin/chromedriver"))?;
+    // Create a tracing layer with the configured tracer
+    let tracing_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-        // Set the executable permission for chromedriver
-        let mut perms = file.metadata()?.permissions();
-        perms.set_mode(0o755); // -rwxr-xr-x
-        file.set_permissions(perms)?;
-    }
-    Ok(chromedriver_path)
+    // Set the log level
+    let env_filter_layer = EnvFilter::from_default_env();
+
+    // Format the log
+    let format_layer = tracing_subscriber::fmt::layer()
+        // Use a more compact, abbreviated log format
+        .compact()
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    // Set up context propagation
+    global::set_text_map_propagator(TraceContextPropagator::default());
+
+    Registry::default()
+        .with(tracing_layer)
+        .with(env_filter_layer)
+        .with(format_layer)
+        .try_init()
+        .unwrap();
 }
